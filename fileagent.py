@@ -52,7 +52,7 @@ def list_files_in_folder(service, folder_id):
         logger.error(f"Error listing files in folder {folder_id}: {e}")
         raise
 
-@retry(retry=retry_if_exception_type((ConnectionResetError, OSError)),
+@retry(retry=retry_if_exception_type((ConnectionResetError, OSError, ssl.SSLError)),
        stop=stop_after_attempt(5),
        wait=wait_exponential(multiplier=1, min=4, max=10),
        before_sleep=before_sleep_log(logger, logging.WARNING))
@@ -77,7 +77,7 @@ def download_file(service, file_id, file_name, destination_folder, counters):
             elif mime_type == 'application/vnd.google-apps.presentation':
                 export_mime_type = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
             else:
-                logger.warning(f"Skipping unsupported Google file type: {mime_type}")
+                logger.info(f"Skipping unsupported Google file type: {mime_type}")
                 counters['skipped'] += 1
                 update_terminal_status(counters)
                 return
@@ -104,6 +104,9 @@ def download_file(service, file_id, file_name, destination_folder, counters):
                     try:
                         status, done = downloader.next_chunk()
                         logger.info(f"Downloading {file_name}: {int(status.progress() * 100)}% complete")
+                    except ssl.SSLError as e:
+                        logger.warning(f"SSL error during download of {file_name}: {str(e)}. Retrying...")
+                        raise
                     except Exception as e:
                         if "downloadQuotaExceeded" in str(e) or "rateLimitExceeded" in str(e):
                             logger.warning(f"Download quota exceeded or rate limit exceeded for file: {file_name}. Skipping.")
@@ -126,6 +129,9 @@ def download_file(service, file_id, file_name, destination_folder, counters):
         counters['downloaded'] += 1
         counters['downloaded_files'].append(file_path)
 
+    except ssl.SSLError as e:
+        logger.error(f"SSL error while downloading file {file_name}: {str(e)}")
+        counters['failed'] += 1
     except Exception as e:
         logger.error(f"An error occurred while downloading file {file_name}: {str(e)}")
         counters['failed'] += 1
@@ -276,6 +282,12 @@ if __name__ == '__main__':
         'total_files': 0,
         'downloaded_files': []  # List to keep track of downloaded files
     }
+    
+    print("Root Shared Folders: ")
+    for folder_info in shared_folder_data:
+        folder_id = folder_info['id']
+        dest_dir = folder_info['dest_dir']
+        print(f"{dest_dir} from id {folder_id}")
 
     for folder_info in shared_folder_data:
         folder_id = folder_info['id']
@@ -286,7 +298,7 @@ if __name__ == '__main__':
         if not os.path.exists(root_destination):
             os.makedirs(root_destination)
 
-        logger.info(f"Downloading into {root_destination} from id {folder_id}")
+        logger.info(f"Downloading into {root_destination} from id {folder_id} in {dest_dir}")
         update_terminal_status(counters)
         download_all_files_in_folder(service, folder_id, root_destination, counters, num_workers)
 
