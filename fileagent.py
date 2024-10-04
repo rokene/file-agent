@@ -1,10 +1,10 @@
 import os
 import io
 import pickle
-import mimetypes
 import re
 import json
 import logging
+import ssl
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -133,45 +133,52 @@ def download_file(service, file_id, file_name, destination_folder, counters):
     # Update terminal output with current status counts
     update_terminal_status(counters)
 
+@retry(retry=retry_if_exception_type((ConnectionResetError, OSError, ssl.SSLError)),
+       stop=stop_after_attempt(5),
+       wait=wait_exponential(multiplier=1, min=4, max=10),
+       before_sleep=before_sleep_log(logger, logging.WARNING))
 def file_already_exists(destination_folder, file_name, file_id, service):
     """Check if a file already exists and matches the version on Google Drive by comparing file ID, size, and modified time."""
     file_path = os.path.join(destination_folder, file_name)
-    if not os.path.exists(file_path):
-        return False
-
-    # Get file metadata from Google Drive to compare
-    try:
-        file_metadata = service.files().get(fileId=file_id, fields="size, modifiedTime").execute()
-        drive_file_size = int(file_metadata.get('size', 0))
-        drive_modified_time = file_metadata.get('modifiedTime')
-    except Exception as e:
-        logger.error(f"Error fetching metadata for file ID {file_id}: {str(e)}")
-        return False
-
-    # Check if metadata file exists for local file
     metadata_file_path = file_path + '.meta'
-    if not os.path.exists(metadata_file_path):
+
+    # Check if both the file and its metadata exist
+    if not os.path.exists(file_path) or not os.path.exists(metadata_file_path):
         return False
 
-    # Read the stored metadata with error handling for corrupted files
+    # Attempt to read the stored metadata
     try:
         with open(metadata_file_path, 'r') as meta_file:
             metadata = json.load(meta_file)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, IOError):
         logger.warning(f"Corrupted metadata file found: {metadata_file_path}. Deleting and re-downloading.")
-        os.remove(metadata_file_path)
+        os.remove(metadata_file_path)  # Delete corrupted metadata to force redownload
         return False
 
+    # Get the file metadata from Google Drive for comparison
+    try:
+        drive_metadata = service.files().get(fileId=file_id, fields="size, modifiedTime").execute()
+        drive_file_size = int(drive_metadata.get('size', 0))
+        drive_modified_time = drive_metadata.get('modifiedTime')
+    except HttpError as e:
+        logger.error(f"Error fetching metadata for file ID {file_id}: {str(e)}")
+        return False
+    except ssl.SSLError as e:
+        logger.error(f"SSL error while fetching metadata for file ID {file_id}: {str(e)}")
+        raise  # Trigger retry mechanism
+
+    # Extract information from the stored metadata
     existing_file_id = metadata.get('file_id')
     existing_file_size = metadata.get('size')
     existing_modified_time = metadata.get('modified_time')
 
-    # Compare Google Drive file ID, size, and modified time with local metadata
+    # Compare file ID, size, and modified time to determine if re-download is needed
     if (existing_file_id == file_id and
         existing_file_size == drive_file_size and
         existing_modified_time == drive_modified_time):
         return True
 
+    # If metadata does not match, the file needs to be downloaded again
     return False
 
 def authenticate():
@@ -215,8 +222,14 @@ def download_all_files_in_folder(service, folder_id, destination_root, counters,
         future_to_file = {
             executor.submit(download_file, service, file['id'], sanitize_filename(file['name']), destination_root, counters): file
             for file in files
-            if file['mimeType'] != 'application/vnd.google-apps.folder'  # Skip folders for individual download tasks
+            if file['mimeType'] != 'application/vnd.google-apps.folder' and not file_already_exists(destination_root, sanitize_filename(file['name']), file['id'], service)
         }
+
+        # Process skipped files
+        for file in files:
+            if file['mimeType'] != 'application/vnd.google-apps.folder' and file_already_exists(destination_root, sanitize_filename(file['name']), file['id'], service):
+                counters['skipped'] += 1
+                update_terminal_status(counters)
 
         # Process folders in a non-parallel way to maintain folder structure
         for file in files:
