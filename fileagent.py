@@ -5,7 +5,6 @@ import mimetypes
 import re
 import json
 import logging
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -13,6 +12,8 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from logging.handlers import RotatingFileHandler
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from googleapiclient.errors import HttpError
 
 # Define the scopes for Google Drive API
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
@@ -26,54 +27,6 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger()
-
-def sanitize_filename(filename, max_length=50):
-    """Sanitize the filename to remove invalid characters and shorten the length."""
-    sanitized = re.sub(r'[<>:"/\\|?*]', '', filename)
-    if len(sanitized) > max_length:
-        sanitized = sanitized[:max_length] + '...'
-    return sanitized
-
-def file_already_exists(destination_folder, file_name, file_id, service):
-    """Check if a file already exists and matches the version on Google Drive by comparing file ID, size, and modified time."""
-    file_path = os.path.join(destination_folder, file_name)
-    if not os.path.exists(file_path):
-        return False
-
-    # Get file metadata from Google Drive to compare
-    try:
-        file_metadata = service.files().get(fileId=file_id, fields="size, modifiedTime").execute()
-        drive_file_size = int(file_metadata.get('size', 0))
-        drive_modified_time = file_metadata.get('modifiedTime')
-    except Exception as e:
-        logger.error(f"Error fetching metadata for file ID {file_id}: {str(e)}")
-        return False
-
-    # Check if metadata file exists for local file
-    metadata_file_path = file_path + '.meta'
-    if not os.path.exists(metadata_file_path):
-        return False
-
-    # Read the stored metadata with error handling for corrupted files
-    try:
-        with open(metadata_file_path, 'r') as meta_file:
-            metadata = json.load(meta_file)
-    except json.JSONDecodeError:
-        logger.warning(f"Corrupted metadata file found: {metadata_file_path}. Deleting and re-downloading.")
-        os.remove(metadata_file_path)
-        return False
-
-    existing_file_id = metadata.get('file_id')
-    existing_file_size = metadata.get('size')
-    existing_modified_time = metadata.get('modified_time')
-
-    # Compare Google Drive file ID, size, and modified time with local metadata
-    if (existing_file_id == file_id and
-        existing_file_size == drive_file_size and
-        existing_modified_time == drive_modified_time):
-        return True
-
-    return False
 
 def authenticate():
     """Authenticate and return a Google Drive API service instance."""
@@ -103,15 +56,28 @@ def authenticate():
         logger.error(f"Authentication failed: {str(e)}")
         raise
 
+def sanitize_filename(filename, max_length=50):
+    """Sanitize the filename to remove invalid characters and shorten the length."""
+    sanitized = re.sub(r'[<>:"/\\|?*]', '', filename)
+    if len(sanitized) > max_length:
+        sanitized = sanitized[:max_length] + '...'
+    return sanitized
+
+@retry(retry=retry_if_exception_type(ConnectionResetError), stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=10))
 def list_files_in_folder(service, folder_id):
     """List all files in a specified Google Drive folder."""
-    results = service.files().list(
-        q=f"'{folder_id}' in parents and trashed=false",
-        fields="files(id, name)"
-    ).execute()
-    items = results.get('files', [])
-    return items
+    try:
+        results = service.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="files(id, name, mimeType)"
+        ).execute()
+        items = results.get('files', [])
+        return items
+    except HttpError as e:
+        logger.error(f"Error listing files in folder {folder_id}: {e}")
+        raise
 
+@retry(retry=retry_if_exception_type(ConnectionResetError), stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=10))
 def download_file(service, file_id, file_name, destination_folder, counters):
     """Download a file from Google Drive to a local destination."""
     try:
