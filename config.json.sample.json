@@ -1,0 +1,13 @@
+{
+  "num_workers": 2,
+  "gdrive-shared-dir": [
+    {
+        "id": "1gGXkWsMhqzxroc4Qpru1uvo00BUYSHkm",
+        "dest_dir": "dnd-minis"
+    },
+    {
+        "id": "11Yo4cHNwA9p5CRe5NiwyxYcdS4x5BLmC",
+        "dest_dir": "dnd-minis-commercial"
+    }
+  ]
+}

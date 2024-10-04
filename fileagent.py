@@ -193,6 +193,9 @@ def download_all_files_in_folder(service, folder_id, destination_root, counters)
     """Download all files in a specified Google Drive folder under a given destination root."""
     # List all items in the current folder
     files = list_files_in_folder(service, folder_id)
+    
+    # Add to total files count
+    counters['total_files'] += len(files)
 
     for file in files:
         file_id = file['id']
@@ -221,7 +224,7 @@ def download_all_files_in_folder(service, folder_id, destination_root, counters)
 
 def update_terminal_status(counters):
     """Update terminal status line with current counts of downloaded, skipped, and failed files."""
-    print(f"\rSuccessfully Downloaded: {counters['downloaded']} | Skipped: {counters['skipped']} | Failed: {counters['failed']}", end='', flush=True)
+    print(f"\rTotal Files: {counters['total_files']} | Successfully Downloaded: {counters['downloaded']} | Skipped: {counters['skipped']} | Failed: {counters['failed']}", end='', flush=True)
 
 if __name__ == '__main__':
     base_directory = os.getcwd()  # Use the current working directory
@@ -232,11 +235,12 @@ if __name__ == '__main__':
 
     service = authenticate()
 
-    # Initialize counters for skipped, failed, and downloaded items
+    # Initialize counters for skipped, failed, downloaded items, and total files
     counters = {
         'skipped': 0,
         'failed': 0,
         'downloaded': 0,
+        'total_files': 0,
         'downloaded_files': []  # List to keep track of downloaded files
     }
 
