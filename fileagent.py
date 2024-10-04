@@ -77,7 +77,7 @@ def download_file(service, file_id, file_name, destination_folder, counters):
             elif mime_type == 'application/vnd.google-apps.presentation':
                 export_mime_type = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
             else:
-                logger.info(f"Skipping unsupported Google file type: {mime_type}")
+                logger.warning(f"Skipping unsupported Google file type: {mime_type}")
                 counters['skipped'] += 1
                 update_terminal_status(counters)
                 return
@@ -228,6 +228,7 @@ def download_all_files_in_folder(service, folder_id, destination_root, counters,
         # Process skipped files
         for file in files:
             if file['mimeType'] != 'application/vnd.google-apps.folder' and file_already_exists(destination_root, sanitize_filename(file['name']), file['id'], service):
+                logger.warning(f"Skipping already downloaded file: {file['name']} ({file['id']})")
                 counters['skipped'] += 1
                 update_terminal_status(counters)
 
