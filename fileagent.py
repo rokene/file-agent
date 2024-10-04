@@ -98,7 +98,7 @@ def download_file(service, file_id, file_name, destination_folder):
     try:
         file_path = os.path.join(destination_folder, file_name)
         print(f"Downloading to: {file_path}")  # Output the full file path
-        
+
         # Get file metadata to determine the MIME type
         file_metadata = service.files().get(fileId=file_id, fields="mimeType, size, modifiedTime").execute()
         mime_type = file_metadata.get('mimeType')
