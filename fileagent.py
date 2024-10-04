@@ -12,7 +12,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from logging.handlers import RotatingFileHandler
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
 from googleapiclient.errors import HttpError
 
 # Define the scopes for Google Drive API
@@ -27,6 +27,152 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger()
+
+def sanitize_filename(filename, max_length=50):
+    """Sanitize the filename to remove invalid characters and shorten the length."""
+    sanitized = re.sub(r'[<>:"/\\|?*]', '', filename)
+    if len(sanitized) > max_length:
+        sanitized = sanitized[:max_length] + '...'
+    return sanitized
+
+@retry(retry=retry_if_exception_type((ConnectionResetError, OSError)),
+       stop=stop_after_attempt(5),
+       wait=wait_exponential(multiplier=1, min=4, max=10),
+       before_sleep=before_sleep_log(logger, logging.WARNING))
+def list_files_in_folder(service, folder_id):
+    """List all files in a specified Google Drive folder with retry on errors."""
+    try:
+        results = service.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="files(id, name, mimeType)"
+        ).execute()
+        items = results.get('files', [])
+        return items
+    except HttpError as e:
+        logger.error(f"Error listing files in folder {folder_id}: {e}")
+        raise
+
+@retry(retry=retry_if_exception_type((ConnectionResetError, OSError)),
+       stop=stop_after_attempt(5),
+       wait=wait_exponential(multiplier=1, min=4, max=10),
+       before_sleep=before_sleep_log(logger, logging.WARNING))
+def download_file(service, file_id, file_name, destination_folder, counters):
+    """Download a file from Google Drive to a local destination with retry on errors."""
+    try:
+        file_path = os.path.join(destination_folder, file_name)
+        logger.info(f"Downloading to: {file_path}")
+
+        # Get file metadata to determine the MIME type
+        file_metadata = service.files().get(fileId=file_id, fields="mimeType, size, modifiedTime").execute()
+        mime_type = file_metadata.get('mimeType')
+        drive_file_size = int(file_metadata.get('size', 0))
+        drive_modified_time = file_metadata.get('modifiedTime')
+
+        if mime_type.startswith('application/vnd.google-apps'):
+            # Handle Google Docs, Sheets, Slides, etc.
+            if mime_type == 'application/vnd.google-apps.document':
+                export_mime_type = 'application/pdf'
+            elif mime_type == 'application/vnd.google-apps.spreadsheet':
+                export_mime_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            elif mime_type == 'application/vnd.google-apps.presentation':
+                export_mime_type = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+            else:
+                logger.info(f"Skipping unsupported Google file type: {mime_type}")
+                counters['skipped'] += 1
+                update_terminal_status(counters)
+                return
+
+            request = service.files().export_media(fileId=file_id, mimeType=export_mime_type)
+            if not file_name.endswith('.pdf') and export_mime_type == 'application/pdf':
+                file_name += '.pdf'
+
+            file_path = os.path.join(destination_folder, file_name)
+
+            with io.FileIO(file_path, 'wb') as file:
+                downloader = MediaIoBaseDownload(file, request)
+                done = False
+                while not done:
+                    status, done = downloader.next_chunk()
+                    logger.info(f"Exporting {file_name}: {int(status.progress() * 100)}% complete")
+        else:
+            request = service.files().get_media(fileId=file_id)
+
+            with io.FileIO(file_path, 'wb') as file:
+                downloader = MediaIoBaseDownload(file, request)
+                done = False
+                while not done:
+                    try:
+                        status, done = downloader.next_chunk()
+                        logger.info(f"Downloading {file_name}: {int(status.progress() * 100)}% complete")
+                    except Exception as e:
+                        if "downloadQuotaExceeded" in str(e) or "rateLimitExceeded" in str(e):
+                            logger.warning(f"Download quota exceeded or rate limit exceeded for file: {file_name}. Skipping.")
+                            counters['skipped'] += 1
+                            update_terminal_status(counters)
+                            return
+                        else:
+                            raise
+
+        # Save metadata about the downloaded file (file ID, size, and modified time) to avoid redownloading
+        metadata = {
+            'file_id': file_id,
+            'size': drive_file_size,
+            'modified_time': drive_modified_time
+        }
+        with open(file_path + '.meta', 'w') as meta_file:
+            json.dump(metadata, meta_file)
+
+        # Increment downloaded files counter and record file path
+        counters['downloaded'] += 1
+        counters['downloaded_files'].append(file_path)
+
+    except Exception as e:
+        logger.error(f"An error occurred while downloading file {file_name}: {str(e)}")
+        counters['failed'] += 1
+
+    # Update terminal output with current status counts
+    update_terminal_status(counters)
+
+def file_already_exists(destination_folder, file_name, file_id, service):
+    """Check if a file already exists and matches the version on Google Drive by comparing file ID, size, and modified time."""
+    file_path = os.path.join(destination_folder, file_name)
+    if not os.path.exists(file_path):
+        return False
+
+    # Get file metadata from Google Drive to compare
+    try:
+        file_metadata = service.files().get(fileId=file_id, fields="size, modifiedTime").execute()
+        drive_file_size = int(file_metadata.get('size', 0))
+        drive_modified_time = file_metadata.get('modifiedTime')
+    except Exception as e:
+        logger.error(f"Error fetching metadata for file ID {file_id}: {str(e)}")
+        return False
+
+    # Check if metadata file exists for local file
+    metadata_file_path = file_path + '.meta'
+    if not os.path.exists(metadata_file_path):
+        return False
+
+    # Read the stored metadata with error handling for corrupted files
+    try:
+        with open(metadata_file_path, 'r') as meta_file:
+            metadata = json.load(meta_file)
+    except json.JSONDecodeError:
+        logger.warning(f"Corrupted metadata file found: {metadata_file_path}. Deleting and re-downloading.")
+        os.remove(metadata_file_path)
+        return False
+
+    existing_file_id = metadata.get('file_id')
+    existing_file_size = metadata.get('size')
+    existing_modified_time = metadata.get('modified_time')
+
+    # Compare Google Drive file ID, size, and modified time with local metadata
+    if (existing_file_id == file_id and
+        existing_file_size == drive_file_size and
+        existing_modified_time == drive_modified_time):
+        return True
+
+    return False
 
 def authenticate():
     """Authenticate and return a Google Drive API service instance."""
@@ -55,106 +201,6 @@ def authenticate():
     except Exception as e:
         logger.error(f"Authentication failed: {str(e)}")
         raise
-
-def sanitize_filename(filename, max_length=50):
-    """Sanitize the filename to remove invalid characters and shorten the length."""
-    sanitized = re.sub(r'[<>:"/\\|?*]', '', filename)
-    if len(sanitized) > max_length:
-        sanitized = sanitized[:max_length] + '...'
-    return sanitized
-
-@retry(retry=retry_if_exception_type(ConnectionResetError), stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=10))
-def list_files_in_folder(service, folder_id):
-    """List all files in a specified Google Drive folder."""
-    try:
-        results = service.files().list(
-            q=f"'{folder_id}' in parents and trashed=false",
-            fields="files(id, name, mimeType)"
-        ).execute()
-        items = results.get('files', [])
-        return items
-    except HttpError as e:
-        logger.error(f"Error listing files in folder {folder_id}: {e}")
-        raise
-
-@retry(retry=retry_if_exception_type(ConnectionResetError), stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=10))
-def download_file(service, file_id, file_name, destination_folder, counters):
-    """Download a file from Google Drive to a local destination."""
-    try:
-        file_path = os.path.join(destination_folder, file_name)
-        logger.info(f"Downloading to: {file_path}")  # Log the full file path
-
-        # Get file metadata to determine the MIME type
-        file_metadata = service.files().get(fileId=file_id, fields="mimeType, size, modifiedTime").execute()
-        mime_type = file_metadata.get('mimeType')
-        drive_file_size = int(file_metadata.get('size', 0))
-        drive_modified_time = file_metadata.get('modifiedTime')
-
-        if mime_type.startswith('application/vnd.google-apps'):
-            # Handle Google Docs, Sheets, Slides, etc.
-            if mime_type == 'application/vnd.google-apps.document':
-                export_mime_type = 'application/pdf'  # You can change this to another export type if needed
-            elif mime_type == 'application/vnd.google-apps.spreadsheet':
-                export_mime_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-            elif mime_type == 'application/vnd.google-apps.presentation':
-                export_mime_type = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-            else:
-                logger.info(f"Skipping unsupported Google file type: {mime_type}")
-                counters['skipped'] += 1
-                update_terminal_status(counters)
-                return
-
-            request = service.files().export_media(fileId=file_id, mimeType=export_mime_type)
-            if not file_name.endswith('.pdf') and export_mime_type == 'application/pdf':
-                file_name += '.pdf'  # Add the correct extension if exporting to PDF
-
-            file_path = os.path.join(destination_folder, file_name)
-
-            with io.FileIO(file_path, 'wb') as file:
-                downloader = MediaIoBaseDownload(file, request)
-                done = False
-                while not done:
-                    status, done = downloader.next_chunk()
-                    logger.info(f"Exporting {file_name}: {int(status.progress() * 100)}% complete")
-        else:
-            request = service.files().get_media(fileId=file_id)
-
-            with io.FileIO(file_path, 'wb') as file:
-                downloader = MediaIoBaseDownload(file, request)
-                done = False
-                while not done:
-                    try:
-                        status, done = downloader.next_chunk()
-                        logger.info(f"Downloading {file_name}: {int(status.progress() * 100)}% complete")
-                    except Exception as e:
-                        # Catch the download quota exceeded or rate limit exceeded error
-                        if "downloadQuotaExceeded" in str(e) or "rateLimitExceeded" in str(e):
-                            logger.warning(f"Download quota exceeded or rate limit exceeded for file: {file_name}. Skipping.")
-                            counters['skipped'] += 1
-                            update_terminal_status(counters)
-                            return
-                        else:
-                            raise
-
-        # Save metadata about the downloaded file (file ID, size, and modified time) to avoid redownloading
-        metadata = {
-            'file_id': file_id,
-            'size': drive_file_size,
-            'modified_time': drive_modified_time
-        }
-        with open(file_path + '.meta', 'w') as meta_file:
-            json.dump(metadata, meta_file)
-
-        # Increment downloaded files counter and record file path
-        counters['downloaded'] += 1
-        counters['downloaded_files'].append(file_path)
-
-    except Exception as e:
-        logger.error(f"An error occurred while downloading file {file_name}: {str(e)}")
-        counters['failed'] += 1
-
-    # Update terminal output with current status counts
-    update_terminal_status(counters)
 
 def download_all_files_in_folder(service, folder_id, destination_root, counters, num_workers):
     """Download all files in a specified Google Drive folder under a given destination root using a thread pool for parallel downloads."""
