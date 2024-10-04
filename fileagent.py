@@ -290,15 +290,4 @@ if __name__ == '__main__':
         update_terminal_status(counters)
         download_all_files_in_folder(service, folder_id, root_destination, counters, num_workers)
 
-    # Print summary of downloaded, skipped, and failed items
-    print()  # Move to a new line after the last status update
-    logger.info("\nSummary:")
-    logger.info(f"Downloaded files: {counters['downloaded']}")
-    logger.info(f"Skipped files: {counters['skipped']}")
-    logger.info(f"Failed files: {counters['failed']}")
-
-    # Print list of downloaded files
-    if counters['downloaded'] > 0:
-        logger.info("\nList of downloaded files:")
-        for downloaded_file in counters['downloaded_files']:
-            logger.info(downloaded_file)
+    print("Complete")
