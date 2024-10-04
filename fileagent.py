@@ -6,6 +6,7 @@ import re
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -189,37 +190,39 @@ def download_file(service, file_id, file_name, destination_folder, counters):
     # Update terminal output with current status counts
     update_terminal_status(counters)
 
-def download_all_files_in_folder(service, folder_id, destination_root, counters):
-    """Download all files in a specified Google Drive folder under a given destination root."""
+def download_all_files_in_folder(service, folder_id, destination_root, counters, num_workers):
+    """Download all files in a specified Google Drive folder under a given destination root using a thread pool for parallel downloads."""
     # List all items in the current folder
     files = list_files_in_folder(service, folder_id)
     
     # Add to total files count
     counters['total_files'] += len(files)
 
-    for file in files:
-        file_id = file['id']
-        file_name = sanitize_filename(file['name'])
+    # Create a thread pool for downloading files in parallel
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        future_to_file = {
+            executor.submit(download_file, service, file['id'], sanitize_filename(file['name']), destination_root, counters): file
+            for file in files
+            if file['mimeType'] != 'application/vnd.google-apps.folder'  # Skip folders for individual download tasks
+        }
 
-        # Get the file metadata to determine if it is a folder
-        file_metadata = service.files().get(fileId=file_id, fields="mimeType").execute()
-        mime_type = file_metadata.get('mimeType')
+        # Process folders in a non-parallel way to maintain folder structure
+        for file in files:
+            if file['mimeType'] == 'application/vnd.google-apps.folder':
+                logger.info(f"Found folder: {file['name']} ({file['id']})")
+                new_destination = os.path.join(destination_root, sanitize_filename(file['name']))
+                if not os.path.exists(new_destination):
+                    os.makedirs(new_destination)
+                download_all_files_in_folder(service, file['id'], new_destination, counters, num_workers)
 
-        if mime_type == 'application/vnd.google-apps.folder':
-            # If the item is a folder, recursively download its contents
-            logger.info(f"Found folder: {file_name} ({file_id})")
-            new_destination = os.path.join(destination_root, file_name)
-            if not os.path.exists(new_destination):
-                os.makedirs(new_destination)
-            download_all_files_in_folder(service, file_id, new_destination, counters)
-        else:
-            # If the item is a file, download it if it does not already exist
-            if not file_already_exists(destination_root, file_name, file_id, service):
-                logger.info(f"Downloading file: {file_name} ({file_id})")
-                download_file(service, file_id, file_name, destination_root, counters)
-            else:
-                logger.info(f"Skipping existing file: {file_name}")
-                counters['skipped'] += 1
+        # Wait for all parallel tasks to complete
+        for future in as_completed(future_to_file):
+            file = future_to_file[future]
+            try:
+                future.result()
+            except Exception as e:
+                logger.error(f"Error downloading file {file['name']} ({file['id']}): {str(e)}")
+                counters['failed'] += 1
                 update_terminal_status(counters)
 
 def update_terminal_status(counters):
@@ -228,10 +231,14 @@ def update_terminal_status(counters):
 
 if __name__ == '__main__':
     base_directory = os.getcwd()  # Use the current working directory
-    shared_folder_data = None
 
+    # Load configuration from 'config.json'
     with open('config.json', 'r') as config_file:
-        shared_folder_data = json.load(config_file)
+        config_data = json.load(config_file)
+
+    # Extract number of workers and shared directories list
+    num_workers = config_data.get('num_workers', 1)
+    shared_folder_data = config_data.get('gdrive-shared-dir', [])
 
     service = authenticate()
 
@@ -255,7 +262,7 @@ if __name__ == '__main__':
 
         logger.info(f"Downloading into {root_destination} from id {folder_id}")
         update_terminal_status(counters)
-        download_all_files_in_folder(service, folder_id, root_destination, counters)
+        download_all_files_in_folder(service, folder_id, root_destination, counters, num_workers)
 
     # Print summary of downloaded, skipped, and failed items
     print()  # Move to a new line after the last status update
