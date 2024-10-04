@@ -136,8 +136,16 @@ def download_file(service, file_id, file_name, destination_folder):
                 downloader = MediaIoBaseDownload(file, request)
                 done = False
                 while not done:
-                    status, done = downloader.next_chunk()
-                    print(f"Downloading {file_name}: {int(status.progress() * 100)}% complete")
+                    try:
+                        status, done = downloader.next_chunk()
+                        print(f"Downloading {file_name}: {int(status.progress() * 100)}% complete")
+                    except Exception as e:
+                        # Catch the download quota exceeded error
+                        if "downloadQuotaExceeded" in str(e):
+                            print(f"Download quota exceeded for file: {file_name}. Skipping.")
+                            return
+                        else:
+                            raise
 
         # Save metadata about the downloaded file (file ID, size, and modified time) to avoid redownloading
         metadata = {
