@@ -282,12 +282,6 @@ if __name__ == '__main__':
         'total_files': 0,
         'downloaded_files': []  # List to keep track of downloaded files
     }
-    
-    print("Root Shared Folders: ")
-    for folder_info in shared_folder_data:
-        folder_id = folder_info['id']
-        dest_dir = folder_info['dest_dir']
-        print(f"{dest_dir} from id {folder_id}")
 
     for folder_info in shared_folder_data:
         folder_id = folder_info['id']
@@ -298,7 +292,7 @@ if __name__ == '__main__':
         if not os.path.exists(root_destination):
             os.makedirs(root_destination)
 
-        logger.info(f"Downloading into {root_destination} from id {folder_id} in {dest_dir}")
+        print(f"Starting download into {root_destination} from id {folder_id} in {dest_dir}\n")
         update_terminal_status(counters)
         download_all_files_in_folder(service, folder_id, root_destination, counters, num_workers)
 
