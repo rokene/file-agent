@@ -14,3 +14,7 @@ Modify [config.json](./config.json) to customize shared folders.
 Setup: `py -m pip install -r requirements.txt`
 
 Execute the script: `py fileagent.py`
+
+## Known Issues
+
+* SSL Version errors occur when congiured to use more than one worker.

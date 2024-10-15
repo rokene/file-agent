@@ -5,6 +5,7 @@ import re
 import json
 import logging
 import ssl
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List, Tuple
 
@@ -78,6 +79,7 @@ def list_files_in_folder(service: Any, folder_id: str) -> List[Dict[str, Any]]:
         return items
     except HttpError as e:
         logger.error(f"Error listing files in folder {folder_id}: {e}")
+        logger.error(traceback.format_exc())
         raise
 
 @retry(
@@ -142,6 +144,7 @@ def download_file(
                         return (file_name, False, "Quota or rate limit exceeded")
                     else:
                         logger.error(f"HTTP error during download of {file_name}: {e}")
+                        logger.error(traceback.format_exc())
                         raise
 
         # Save metadata about the downloaded file
@@ -158,9 +161,11 @@ def download_file(
 
     except ssl.SSLError as e:
         logger.error(f"SSL error while downloading file {file_name}: {e}")
+        logger.error(traceback.format_exc())
         return (file_name, False, f"SSL error: {e}")
     except Exception as e:
         logger.error(f"An error occurred while downloading file {file_name}: {e}")
+        logger.error(traceback.format_exc())
         return (file_name, False, str(e))
     finally:
         if file:
@@ -169,6 +174,7 @@ def download_file(
                 logger.debug(f"Closed file: {destination_path}")
             except Exception as close_error:
                 logger.error(f"Error closing file {destination_path}: {close_error}")
+                logger.error(traceback.format_exc())
 
 def get_export_mime_type_and_extension(mime_type: str, file_name: str) -> Tuple[str, str]:
     """
@@ -219,9 +225,11 @@ def file_already_exists(
         drive_modified_time = drive_metadata.get('modifiedTime')
     except HttpError as e:
         logger.error(f"Error fetching metadata for file ID {file_id}: {e}")
+        logger.error(traceback.format_exc())
         return False
     except ssl.SSLError as e:
         logger.error(f"SSL error while fetching metadata for file ID {file_id}: {e}")
+        logger.error(traceback.format_exc())
         raise
 
     if (
@@ -264,7 +272,28 @@ def authenticate() -> Any:
 
     except Exception as e:
         logger.error(f"Authentication failed: {e}")
+        logger.error(traceback.format_exc())
         raise
+
+def get_all_files(service: Any, folder_id: str) -> List[Dict[str, Any]]:
+    """
+    Recursively retrieve all files (not folders) within the specified folder and its subfolders.
+    """
+    try:
+        items = list_files_in_folder(service, folder_id)
+        all_files = []
+        for item in items:
+            if item['mimeType'] == 'application/vnd.google-apps.folder':
+                # Recursively get files from subfolders
+                subfolder_files = get_all_files(service, item['id'])
+                all_files.extend(subfolder_files)
+            else:
+                all_files.append(item)
+        return all_files
+    except Exception as e:
+        logger.error(f"Error retrieving files from folder ID {folder_id}: {e}")
+        logger.error(traceback.format_exc())
+        return []
 
 def process_subdirectory(
     service: Any,
@@ -275,7 +304,8 @@ def process_subdirectory(
     lock: threading.Lock
 ) -> None:
     """
-    Process each first-level subdirectory within a shared folder: collect files, download them, and report stats.
+    Process each first-level subdirectory within a shared folder: collect files (including in deeper subfolders),
+    download them, and report stats.
     """
     shared_folder_id = folder_info.get('id')
     dest_dir = sanitize_filename(folder_info.get('dest_dir'))
@@ -286,85 +316,43 @@ def process_subdirectory(
     logger.info(f"Starting download into '{shared_folder_local_path}' from folder ID '{shared_folder_id}'.")
     print(f"\nStarting download into '{shared_folder_local_path}' from folder ID '{shared_folder_id}'.")
 
-    # List first-level subdirectories in the shared folder
+    # Retrieve all files recursively within the shared folder
     try:
-        items = list_files_in_folder(service, shared_folder_id)
+        all_files = get_all_files(service, shared_folder_id)
     except Exception as e:
-        logger.error(f"Failed to list items in shared folder {shared_folder_id}: {e}")
+        logger.error(f"Failed to retrieve files in shared folder {shared_folder_id}: {e}")
         return
 
-    subfolders = [item for item in items if item['mimeType'] == 'application/vnd.google-apps.folder']
-
-    if not subfolders:
-        logger.info(f"No first-level subdirectories found in shared folder '{shared_folder_id}'.")
-        print(f"No first-level subdirectories found in shared folder '{shared_folder_id}'.")
+    if not all_files:
+        logger.info(f"No files found in shared folder '{shared_folder_id}'.")
+        print(f"No files found in shared folder '{shared_folder_id}'.")
         return
 
-    for subfolder in subfolders:
-        process_first_level_subfolder(
-            service,
-            subfolder,
-            shared_folder_local_path,
-            executor,
-            counters,
-            lock
-        )
-
-def process_first_level_subfolder(
-    service: Any,
-    subfolder_info: Dict[str, Any],
-    parent_local_path: str,
-    executor: ThreadPoolExecutor,
-    counters: Dict[str, Any],
-    lock: threading.Lock
-) -> None:
-    """
-    Process a single first-level subdirectory: collect files, download them, and report stats.
-    """
-    subfolder_id = subfolder_info.get('id')
-    subfolder_name = sanitize_filename(subfolder_info.get('name'))
-    subfolder_local_path = os.path.join(parent_local_path, subfolder_name)
-
-    os.makedirs(subfolder_local_path, exist_ok=True)
-
-    logger.info(f"Starting download into '{subfolder_local_path}' from folder ID '{subfolder_id}'.")
-    print(f"\nStarting download into '{subfolder_local_path}' from folder ID '{subfolder_id}'.")
-
-    # List files in the subdirectory (only first-level)
-    try:
-        items = list_files_in_folder(service, subfolder_id)
-    except Exception as e:
-        logger.error(f"Failed to list files in folder {subfolder_id}: {e}")
-        return
-
+    # Filter out files that are within deeper subfolders
+    # This is already handled by get_all_files, which flattens all files
     files_to_download = []
-    for item in items:
-        if item['mimeType'] == 'application/vnd.google-apps.folder':
-            # Skip deeper subdirectories
-            logger.info(f"Skipping deeper subfolder: {item['name']} (ID: {item['id']})")
+    for item in all_files:
+        sanitized_name = sanitize_filename(item['name'])
+        destination_path = os.path.join(shared_folder_local_path, sanitized_name)
+        if file_already_exists(destination_path, item['id'], service):
+            logger.info(f"Skipping already downloaded file: {destination_path} ({item['id']})")
+            with lock:
+                counters['skipped'] += 1
             continue
         else:
-            sanitized_name = sanitize_filename(item['name'])
-            destination_path = os.path.join(subfolder_local_path, sanitized_name)
-            if file_already_exists(destination_path, item['id'], service):
-                logger.info(f"Skipping already downloaded file: {destination_path} ({item['id']})")
-                with lock:
-                    counters['skipped'] += 1
-                continue
-            else:
-                files_to_download.append((item['id'], sanitized_name, destination_path))
+            files_to_download.append((item['id'], sanitized_name, destination_path))
 
     total_files = len(files_to_download)
     with lock:
         counters['total_files'] += total_files
 
     if total_files == 0:
-        logger.info(f"No new files to download in subfolder '{subfolder_id}'.")
-        print(f"No new files to download in subfolder '{subfolder_id}'.")
+        logger.info(f"No new files to download in subfolder '{shared_folder_id}'.")
+        print(f"No new files to download in subfolder '{shared_folder_id}'.")
         return
 
     # Initialize progress bar for this subdirectory
-    progress_bar = tqdm(total=total_files, desc=f"Downloading '{subfolder_name}'", unit="file")
+    progress_bar = tqdm(total=total_files, desc=f"Downloading '{dest_dir}'", unit="file")
 
     # Track download statistics for this subdirectory
     sub_counters = {
@@ -397,17 +385,18 @@ def process_first_level_subfolder(
                 counters['failed'] += 1
                 sub_counters['failed'] += 1
             logger.error(f"Unhandled exception downloading {file_name}: {e}")
+            logger.error(traceback.format_exc())
         finally:
             progress_bar.update(1)
 
     progress_bar.close()
 
     # Print and log statistics for this subdirectory
-    print(f"\nCompleted downloading '{subfolder_name}':")
+    print(f"\nCompleted downloading '{dest_dir}':")
     print(f"  Successfully Downloaded: {sub_counters['downloaded']}")
     print(f"  Skipped: {sub_counters['skipped']}")
     print(f"  Failed: {sub_counters['failed']}")
-    logger.info(f"Completed downloading '{subfolder_name}': Downloaded={sub_counters['downloaded']}, Skipped={sub_counters['skipped']}, Failed={sub_counters['failed']}")
+    logger.info(f"Completed downloading '{dest_dir}': Downloaded={sub_counters['downloaded']}, Skipped={sub_counters['skipped']}, Failed={sub_counters['failed']}")
 
 def load_config(config_path: str = 'config.json') -> Dict[str, Any]:
     """
@@ -472,6 +461,7 @@ def main() -> None:
                 )
     except Exception as e:
         logger.error(f"Unhandled exception in main thread: {e}")
+        logger.error(traceback.format_exc())
         print(f"Unhandled exception in main thread: {e}")
 
     # Summary
