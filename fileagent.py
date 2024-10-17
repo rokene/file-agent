@@ -313,8 +313,8 @@ def process_subdirectory(
 
     os.makedirs(shared_folder_local_path, exist_ok=True)
 
-    logger.info(f"Starting download into '{shared_folder_local_path}' from folder ID '{shared_folder_id}'.")
-    print(f"\nStarting download into '{shared_folder_local_path}' from folder ID '{shared_folder_id}'.")
+    logger.info(f"Starting download assessment for dest '{shared_folder_local_path}' and for folder ID '{shared_folder_id}'.")
+    print(f"\nStarting download assessment for dest '{shared_folder_local_path}' and for folder ID '{shared_folder_id}'.")
 
     # Retrieve all files recursively within the shared folder
     try:
