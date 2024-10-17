@@ -6,6 +6,8 @@ import json
 import logging
 import ssl
 import traceback
+import argparse
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List, Tuple
 
@@ -275,7 +277,7 @@ def authenticate() -> Any:
         logger.error(traceback.format_exc())
         raise
 
-def get_all_files(service: Any, folder_id: str) -> List[Dict[str, Any]]:
+def get_all_files(service: Any, folder_id: str, parent_path: str = '') -> List[Dict[str, Any]]:
     """
     Recursively retrieve all files (not folders) within the specified folder and its subfolders.
     """
@@ -283,12 +285,18 @@ def get_all_files(service: Any, folder_id: str) -> List[Dict[str, Any]]:
         items = list_files_in_folder(service, folder_id)
         all_files = []
         for item in items:
+            item_name = sanitize_filename(item['name'])
+            item_path = os.path.join(parent_path, item_name)
             if item['mimeType'] == 'application/vnd.google-apps.folder':
-                # Recursively get files from subfolders
-                subfolder_files = get_all_files(service, item['id'])
+                # recursively get all files
+                subfolder_files = get_all_files(service, item['id'], item_path)
                 all_files.extend(subfolder_files)
             else:
-                all_files.append(item)
+                all_files.append({
+                    'id': item['id'],
+                    'name': item_name,
+                    'path': item_path  # Store relative path for each file
+                })
         return all_files
     except Exception as e:
         logger.error(f"Error retrieving files from folder ID {folder_id}: {e}")
@@ -328,19 +336,17 @@ def process_subdirectory(
         print(f"No files found in shared folder '{shared_folder_id}'.")
         return
 
-    # Filter out files that are within deeper subfolders
-    # This is already handled by get_all_files, which flattens all files
+    # Filter out files that have not been downloaded
     files_to_download = []
     for item in all_files:
-        sanitized_name = sanitize_filename(item['name'])
-        destination_path = os.path.join(shared_folder_local_path, sanitized_name)
+        destination_path = os.path.join(shared_folder_local_path, item['path'])  # Use full relative path
         if file_already_exists(destination_path, item['id'], service):
             logger.info(f"Skipping already downloaded file: {destination_path} ({item['id']})")
             with lock:
                 counters['skipped'] += 1
             continue
         else:
-            files_to_download.append((item['id'], sanitized_name, destination_path))
+            files_to_download.append((item['id'], item['name'], destination_path))
 
     total_files = len(files_to_download)
     with lock:
@@ -416,8 +422,45 @@ def load_config(config_path: str = 'config.json') -> Dict[str, Any]:
 
     return config_data
 
+def move_files(service: Any, folder_id: str, base_directory: str) -> None:
+    """
+    Move already downloaded files into the correct folder structure.
+    """
+    logger.info("Starting file organization process without downloading...")
+    
+    try:
+        all_files = get_all_files(service, folder_id)
+    except Exception as e:
+        logger.error(f"Failed to retrieve files in shared folder {folder_id}: {e}")
+        return
+
+    for item in all_files:
+        file_name = sanitize_filename(item['name'])
+        destination_path = os.path.join(base_directory, file_name)
+        correct_folder_path = os.path.join(base_directory, item['path'])  # Get the correct folder path
+
+        if os.path.exists(destination_path):
+            # Create the correct folder structure if it doesn't exist
+            os.makedirs(os.path.dirname(correct_folder_path), exist_ok=True)
+
+            # Move the file to the correct folder
+            try:
+                shutil.move(destination_path, correct_folder_path)
+                logger.info(f"Moved file '{file_name}' to '{correct_folder_path}'")
+            except Exception as e:
+                logger.error(f"Failed to move file {file_name} to {correct_folder_path}: {e}")
+        else:
+            logger.warning(f"File '{file_name}' not found in the destination folder, skipping...")
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Google Drive Download and Organization Script")
+    parser.add_argument('--move-only', action='store_true', help="Move already downloaded files into correct folders without downloading")
+    return parser.parse_args()
+
 def main() -> None:
     base_directory = os.getcwd()
+
+    args = parse_arguments()
 
     try:
         config_data = load_config()
@@ -426,7 +469,6 @@ def main() -> None:
         print(f"Failed to load configuration: {e}")
         return
 
-    num_workers = config_data.get('num_workers', 4)  # Default to 4 workers
     shared_folder_data = config_data.get('gdrive-shared-dir', [])
 
     try:
@@ -436,46 +478,52 @@ def main() -> None:
         print(f"Authentication failed: {e}")
         return
 
-    # Initialize global counters
-    counters = {
-        'skipped': 0,
-        'failed': 0,
-        'downloaded': 0,
-        'total_files': 0
-    }
+    if args.move_only:
+        # Perform file organization without downloading
+        for folder_info in shared_folder_data:
+            move_files(service, folder_info['id'], base_directory)
+    else:
+        num_workers = config_data.get('num_workers', 4)  # Default to 4 workers
 
-    # Lock for thread-safe operations
-    lock = threading.Lock()
+        # Initialize global counters
+        counters = {
+            'skipped': 0,
+            'failed': 0,
+            'downloaded': 0,
+            'total_files': 0
+        }
 
-    try:
-        # Initialize ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            for folder_info in shared_folder_data:
-                process_subdirectory(
-                    service,
-                    folder_info,
-                    base_directory,
-                    executor,
-                    counters,
-                    lock
-                )
-    except Exception as e:
-        logger.error(f"Unhandled exception in main thread: {e}")
-        logger.error(traceback.format_exc())
-        print(f"Unhandled exception in main thread: {e}")
+        # Lock for thread-safe operations
+        lock = threading.Lock()
 
-    # Summary
-    print("\nDownload Summary:")
-    print(f"Total Files: {counters['total_files']}")
-    print(f"Successfully Downloaded: {counters['downloaded']}")
-    print(f"Skipped: {counters['skipped']}")
-    print(f"Failed: {counters['failed']}")
+        try:
+            # Initialize ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                for folder_info in shared_folder_data:
+                    process_subdirectory(
+                        service,
+                        folder_info,
+                        base_directory,
+                        executor,
+                        counters,
+                        lock
+                    )
+        except Exception as e:
+            logger.error(f"Unhandled exception in main thread: {e}")
+            logger.error(traceback.format_exc())
+            print(f"Unhandled exception in main thread: {e}")
 
-    logger.info("Download process completed.")
-    logger.info(f"Total Files: {counters['total_files']}")
-    logger.info(f"Successfully Downloaded: {counters['downloaded']}")
-    logger.info(f"Skipped: {counters['skipped']}")
-    logger.info(f"Failed: {counters['failed']}")
+        print("\nDownload Summary:")
+        print(f"Total Files: {counters['total_files']}")
+        print(f"Successfully Downloaded: {counters['downloaded']}")
+        print(f"Skipped: {counters['skipped']}")
+        print(f"Failed: {counters['failed']}")
+
+        logger.info("Download process completed.")
+        logger.info(f"Total Files: {counters['total_files']}")
+        logger.info(f"Successfully Downloaded: {counters['downloaded']}")
+        logger.info(f"Skipped: {counters['skipped']}")
+        logger.info(f"Failed: {counters['failed']}")
 
 if __name__ == '__main__':
     main()
