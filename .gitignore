@@ -1,4 +1,5 @@
 dnd-minis*
 token.pickle
 credentials.json
+config.json
 *.log*
